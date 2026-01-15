@@ -33,6 +33,8 @@ Crée un fichier **config.json** à côté du script :
 
 > 🔒 Ne le versionne jamais – ajoute‑le à ton .gitignore. 
 
+
+
 ## 🚀 Utilisation
 ```bash
 python lacale_check.py [OPTIONS]
@@ -64,21 +66,42 @@ python lacale_check.py [OPTIONS]
 |--sort|Trier par : oldest / newest / instant (A-Z) / popular / least-popular|
 |--radarr-key KEY / --sonarr-key KEY|Remplacer la clé définie dans config.json.|
 
+
 ## 📚 Exemples concret
-### Voir films manquant sur La Cale
+Voir films manquant sur La Cale
 ```bash
 python lacale_check.py --radarr  --hide-present --sort newest --limit 30
 ```
 
-### Séries Sonarr – quelles saisons manquent ?
+Séries Sonarr – quelles saisons manquent ?
 ```bash
 python lacale_check.py --sonarr --mode season --hide-present --limit 30
 ```
 
-### Dossier local – quels épisodes sont absents ? (et on garde un CSV)
+Dossier local – quels épisodes sont absents ? (et on garde un CSV)
 ```bash
 python lacale_check.py --folder ./mes_videos --mode episode --export manquants.csv
 ```
+
+
+## Exemple de sortie
+```console
+Top 10 les plus populaires
+--------------------------
+| Titre                         |   Année | Sur La Cale   |
+|-------------------------------|---------|---------------|
+| Avatar : De feu et de cendres |    2025 | ❌ Non         |
+| People We Meet on Vacation    |    2026 | ✅ Oui         |
+| Zootopie 2                    |    2025 | ✅ Oui         |
+| Une bataille après l'autre    |    2025 | ❌ Non         |
+| Insaisissables 3              |    2025 | ❌ Non         |
+| Fight Club                    |    1999 | ✅ Oui         |
+| Troll 2                       |    2025 | ✅ Oui         |
+| Avatar : La Voie de l'eau     |    2022 | ✅ Oui         |
+| Tron : Ares                   |    2025 | ✅ Oui         |
+| Zootopie                      |    2016 | ✅ Oui         |
+```
+
 
 ## À venir
 - Comparer les versions locales et présentent sur La Cale
