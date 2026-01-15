@@ -1,0 +1,8 @@
+{
+  "RADARR_URL": "http://127.0.0.1:7878",
+  "SONARR_URL": "http://127.0.0.1:8989",
+  "RADARR_API_KEY": "ta‑clé‑radarr",
+  "SONARR_API_KEY": "ta‑clé‑sonarr",
+  "LACALE_PASSKEY": "ta‑clé‑la‑cale",
+  "LACALE_API_BASE": "https://tracker.la-cale.space/api"
+}
