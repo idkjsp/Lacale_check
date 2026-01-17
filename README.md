@@ -110,6 +110,7 @@ Top 10 les plus populaires
 
 ## À venir
 - Comparer les versions locales et présentent sur La Cale
+- Dire si le fichier est identique ou evaluer si votre version a un intérêt
 - Réduction des faux négatifs (encore)
 - Amélioration du support de Sonarr (trouver une série en intégrale ou juste toutes les saisons une à une par exemple)
 
