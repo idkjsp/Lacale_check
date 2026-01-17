@@ -8,7 +8,7 @@ Fonctionnalités
 * Exécution parallèle des requêtes La Cale.
 * Affichage enrichi (titre, année, saison, épisode, présent / absent).
 * Export CSV optionnel.
-* Tris disponibles : oldest, newest, popular, least‑popular, instant.
+* Tris disponibles : oldest, newest, popular, least‑popular, az.
 * `--hide-present` masque les titres déjà présents.
 
 ## 📦 Prérequis
@@ -59,18 +59,18 @@ python lacale_check.py [OPTIONS]
 ### Options utiles
 |Option|Description|
 |-------|-------|
-|-l / --limit N|Nombre max d’éléments (ou de saisons/épisodes) à traiter (défaut 10).|
-|--year-min Y / --year-max Y|Filtrer les titres par année de production.|
-|--hide-present|Masquer les titres déjà présents sur La Cale.-|
-|--export FILE.csv|Exporter le tableau affiché au format CSV.|
-|--sort|Trier par : oldest / newest / instant (A-Z) / popular / least-popular|
+|-l / --limit N|Nombre max d’éléments (ou de saisons/épisodes) à traiter (défaut 100)|
+|--year-min Y / --year-max Y|Filtrer les titres par année de production|
+|--hide-present|Masquer les titres déjà présents sur La Cale|
+|--export FILE.csv|Exporter le tableau affiché au format CSV|
+|--sort|Trier par : oldest / newest / az (A-Z) / popular / least-popular|
 |--radarr-key KEY / --sonarr-key KEY|Remplacer la clé définie dans config.json.|
 
 
 ## 📚 Exemples concret
-Voir films manquant sur La Cale
+### Voir vos films manquants sur La Cale
 ```bash
-python lacale_check.py --radarr  --hide-present --sort newest --limit 30
+python lacale_check.py --radarr  --hide-present --limit 999999
 ```
 
 Séries Sonarr – quelles saisons manquent ?
@@ -102,9 +102,16 @@ Top 10 les plus populaires
 | Zootopie                      |    2016 | ✅ Oui         |
 ```
 
+# Changelog
+### 1.0.1
+* Blocage de recherche des films suivis sur Radarr mais sous l'état "manquant"
+* Réduction des faux négatifs (via l'utilisation des titres originaux, des titres vf, et d'une normalisation)
+* Modifs mineures
 
 ## À venir
 - Comparer les versions locales et présentent sur La Cale
+- Réduction des faux négatifs (encore)
+- Amélioration du support de Sonarr (trouver une série en intégrale ou juste toutes les saisons une à une par exemple)
 
 ### 📧 Contact
 idkjspp@proton.me
