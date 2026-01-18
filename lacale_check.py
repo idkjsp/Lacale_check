@@ -1,271 +1,359 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, csv, json, re, sys, time, unicodedata
+"""LacaLe Checker – UI minimaliste, légende d’origine et stats.
+"""
+
+# ----------------------------------------------------------------------
+# Imports
+# ----------------------------------------------------------------------
+import argparse, json, re, sys, time, unicodedata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from tabulate import tabulate
 
+# ----------------------------------------------------------------------
+# Couleurs ANSI (légende + stats)
+# ----------------------------------------------------------------------
+class C:
+    R = "\033[91m"; G = "\033[92m"; Y = "\033[93m"; O = "\033[38;5;208m"
+    C = "\033[96m"; B = "\033[94m"; Z = "\033[0m"; BLD = "\033[1m"
+
+# ----------------------------------------------------------------------
+# Configuration (à placer à côté du script)
+# ----------------------------------------------------------------------
 cfg = json.loads(Path(__file__).with_name("config.json").read_text())
-RADARR_URL, SONARR_URL = cfg["RADARR_URL"], cfg["SONARR_URL"]
-RADARR_KEY, SONARR_KEY = cfg["RADARR_API_KEY"], cfg["SONARR_API_KEY"]
+RADARR_URL, RADARR_KEY = cfg["RADARR_URL"], cfg["RADARR_API_KEY"]
 PASSKEY, API_BASE = cfg["LACALE_PASSKEY"], cfg["LACALE_API_BASE"]
 
-TIMEOUT, DELAY, MAX_R, BF = 15, 0.30, 3, 2
+# ----------------------------------------------------------------------
+# HTTP helper (retry on 429)
+# ----------------------------------------------------------------------
+TIMEOUT, RETRIES, BACKOFF = 15, 3, 2
 
 def http_get(url, *, hdr=None, prm=None):
-    attempts = 0
-    while True:
+    for i in range(RETRIES + 1):
         try:
             r = requests.get(url, headers=hdr, params=prm, timeout=TIMEOUT)
-            if r.status_code == 429:
-                if attempts >= MAX_R: return {}
-                time.sleep(BF ** attempts)
-                attempts += 1
+            if r.status_code == 429 and i < RETRIES:
+                time.sleep(BACKOFF * i)
                 continue
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:
-            print(f"[ERROR] {url} → {e}", file=sys.stderr)
+            print(f"{C.R}[ERR]{C.Z} {url} → {e}", file=sys.stderr)
             return {}
 
-def radarr_items(key):
-    data = http_get(f"{RADARR_URL.rstrip('/')}/api/v3/movie", hdr={"X-Api-Key": key})
-    if not isinstance(data, list): return []
+# ----------------------------------------------------------------------
+# Normalisation de texte (pour comparaison)
+# ----------------------------------------------------------------------
+def clean(txt: str) -> str:
+    txt = unicodedata.normalize('NFKD', txt).encode('ascii','ignore').decode().lower()
+    txt = re.sub(r'[^\w\s]', ' ', txt)
+    return re.sub(r'\s+', ' ', txt).strip()
+
+# ----------------------------------------------------------------------
+# Métadonnées depuis le nom de fichier
+# ----------------------------------------------------------------------
+def meta_name(fname: str) -> dict:
+    stem = Path(fname).stem.lower()
+    codec = next((c.replace('x','h'))
+                  for c in ("h264","h265","x264","x265","vp9","av1")
+                  if re.search(rf'\b{c}\b', stem)), None
+    res = (re.search(r'\b(\d{3,4}p|4k)\b', stem) or [None])[0]
+
+    size = None
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(gb|mb|kb)', stem)
+    if m:
+        num, unit = float(m.group(1)), m.group(2)
+        size = int(num * {"kb":1024, "mb":1024**2, "gb":1024**3}[unit])
+    return {"codec": codec, "resolution": res, "size": size}
+
+# ----------------------------------------------------------------------
+# Recherche sur La Cale
+# ----------------------------------------------------------------------
+def lacale(query: str, pk: str, s: int | None = None, e: int | None = None) -> list:
+    q = query.strip() + (f" S{s:02d}" if s else "") + (f"E{e:02d}" if e else "")
+    resp = http_get(f"{API_BASE.rstrip('/')}/external",
+                    prm={"q": q, "passkey": pk})
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict):
+        return resp.get("results", [])
+    return []
+
+def remote_title(item: dict) -> str:
+    return item.get("title") or item.get("name") or ""
+
+# ----------------------------------------------------------------------
+# Comparaison locale ↔︎ distante
+# ----------------------------------------------------------------------
+def compare(local: dict, remote: dict) -> tuple[str, int]:
+    score = 0
+    sz_l, sz_r = local.get("size"), remote.get("size")
+    exact = close = False
+
+    if sz_l and sz_r:
+        diff = abs(sz_l - sz_r)
+        avg  = (sz_l + sz_r) / 2
+        pct  = diff / avg if avg else 1
+        if pct <= 0.01:
+            exact = True; score += 1000
+        elif pct <= 0.20:
+            close = True; score += 500
+
+    codec_match = (local.get("codec") and remote.get("codec") and
+                   local["codec"].lower() == remote["codec"].lower())
+    if codec_match:
+        score += 300
+
+    res_match = (local.get("resolution") and remote.get("resolution") and
+                 local["resolution"].lower() == remote["resolution"].lower())
+    if res_match:
+        score += 200
+
+    if exact:
+        ok_c = not local.get("codec") or not remote.get("codec") or codec_match
+        ok_r = not local.get("resolution") or not remote.get("resolution") or res_match
+        if ok_c and ok_r:
+            return "Exact", score
+    if close or codec_match or res_match:
+        return "Proche", score
+    return "Différent", score
+
+# ----------------------------------------------------------------------
+# Traitement d’un élément (film / série)
+# ----------------------------------------------------------------------
+def check(item: dict, pk: str) -> tuple:
+    remote = lacale(item["title"], pk, item.get("season"), item.get("episode"))
+    if not remote:
+        return (item["title"], str(item.get("year","")), item.get("season"),
+                item.get("episode"), "Manquant", "-")
+
+    best = max(((compare(item["local_meta"], r), r) for r in remote),
+               key=lambda x: x[0][1])
+    status, _ = best[0]
+    match = remote_title(best[1]) or "-"
+    return (item["title"], str(item.get("year","")), item.get("season"),
+            item.get("episode"), status, match)
+
+# ----------------------------------------------------------------------
+# Parallel processing (max 5 threads)
+# ----------------------------------------------------------------------
+def run_parallel(items: list, pk: str, limit: int) -> list:
+    sel = items[:limit]
+    out = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(check, it, pk): it for it in sel}
+        for f in as_completed(futures):
+            out.append(f.result())
+    time.sleep(0.3)            # pause douce entre lots
+    return out
+
+# ----------------------------------------------------------------------
+# Légende d’origine
+# ----------------------------------------------------------------------
+def legend():
+    print("\n")
+    print(f"{C.BLD}{C.C}╔═══════════════════════════════════════════════════════════════╗{C.Z}")
+    print(f"{C.BLD}{C.C}║{C.Z}  {C.BLD}La Cale Checker - Légende des statuts{C.Z}                    {C.BLD}{C.C}║{C.Z}")
+    print(f"{C.BLD}{C.C}╚═══════════════════════════════════════════════════════════════╝{C.Z}\n")
+    print(f"  {C.G}✅ EXACT{C.Z}      → Fichier identique sur La Cale, tu vas pouvoir seeder facile")
+    print(f"  {C.Y}🟩 PROCHE{C.Z}     → Une version similaire est déjà en ligne, à toi de voir !")
+    print(f"  {C.O}🟧 DIFFÉRENT{C.Z}  → Il vaut mieux partager plusieurs versions pour que tout le monde soit heureux..")
+    print(f"  {C.R}❌ MANQUANT{C.Z}   → Tu vas pouvoir nous offrir ce trésor !\n")
+    print("\n")
+
+# ----------------------------------------------------------------------
+# Affichage tableau + stats (avec marges)
+# ----------------------------------------------------------------------
+def show(header: str, rows: list, mode: str):
+    # -------- filter ----------
+    if mode == "missing":
+        rows = [r for r in rows if r[4] == "Manquant"]
+    elif mode == "sent":
+        rows = [r for r in rows if r[4] == "Exact"]
+    elif mode == "versioning":
+        rows = [r for r in rows if r[4] in ("Proche", "Différent")]
+
+    # -------- dynamic columns ----------
+    has_s = any(r[2] is not None for r in rows)
+    has_e = any(r[3] is not None for r in rows)
+
+    cols = ["Titre", "Année"]
+    if has_s: cols.append("Saison")
+    if has_e: cols.append("Épisode")
+    cols.extend(["Statut", "Correspondance"])
+
+    emoji = {"Exact":"✅","Proche":"🟩","Différent":"🟧","Manquant":"❌"}
+    table = []
+    for t, y, s, e, st, mt in rows:
+        row = [t, y]
+        if has_s: row.append(str(s) if s else "")
+        if has_e: row.append(str(e) if e else "")
+        row.append(emoji[st])
+        row.append(mt)
+        table.append(row)
+
+    print("\n")
+    print(f"{C.BLD}{header}{C.Z}\n{'─'*len(header)}")
+    print(tabulate(table, headers=cols, tablefmt="github"))
+    print("\n")
+
+    # -------- stats ----------
+    total = len(rows) or 1
+    cnt = {k: sum(1 for r in rows if r[4] == k)
+           for k in ("Exact","Proche","Différent","Manquant")}
+    print(f"{C.C}📊 Statistiques :{C.Z}")
+    for k in ("Exact","Proche","Différent","Manquant"):
+        col = getattr(C, {"Exact":"G","Proche":"Y","Différent":"O","Manquant":"R"}[k])
+        print(f"  {col}{emoji[k]} {k:<9}{C.Z}: {cnt[k]} ({cnt[k]*100//total}%)")
+    print("\n")
+
+# ----------------------------------------------------------------------
+# Extraction depuis Radarr
+# ----------------------------------------------------------------------
+def radarr_items(key: str) -> list:
+    data = http_get(f"{RADARR_URL.rstrip('/')}/api/v3/movie",
+                    hdr={"X-Api-Key": key})
+    if not isinstance(data, list):
+        return []
     out = []
     for m in data:
         mf = m.get("movieFile")
-        if not mf: continue
+        if not mf:
+            continue
+        path = mf.get("path") or mf.get("relativePath", "")
+        fname = Path(path).stem if path else m.get("title", "")
+        meta = {
+            "size": mf.get("size"),
+            "codec": mf.get("mediaInfo",{}).get("videoCodec"),
+            "resolution": mf.get("mediaInfo",{}).get("resolution")
+        }
+        # Si l'API fournit un champ `popularity`, on le garde tel quel.
         out.append({
-            "title": m.get("title", ""),
+            "title": m.get("title",""),
             "year": m.get("year"),
-            "originalTitle": m.get("originalTitle"),
+            "local_meta": meta,
+            "file_name": fname,
+            "popularity": m.get("popularity")          # <-- possible champ
         })
     return out
 
-def sonarr_series(key):
-    data = http_get(f"{SONARR_URL.rstrip('/')}/api/v3/series", hdr={"X-Api-Key": key})
-    if not isinstance(data, list): return []
-    for s in data:
-        s["season_numbers"] = [sn["seasonNumber"] for sn in s.get("seasons", [])]
-    return data
-
-def sonarr_items(key):
-    series = sonarr_series(key)
-    by_id = {s["id"]: s for s in series}
-    eps = []
-    lst = http_get(f"{SONARR_URL.rstrip('/')}/api/v3/episode", hdr={"X-Api-Key": key}) or []
-    for e in lst:
-        sid = e.get("seriesId")
-        ser = by_id.get(sid)
-        if not ser: continue
-        ef = e.get("episodeFile")
-        if not ef: continue
-        eps.append({
-            "title": ser.get("title", ""),
-            "year": ser.get("year"),
-            "originalTitle": ser.get("originalTitle"),
-            "season": e.get("seasonNumber"),
-            "episode": e.get("episodeNumber"),
+# ----------------------------------------------------------------------
+# Extraction depuis un dossier local
+# ----------------------------------------------------------------------
+def folder_items(root: Path) -> list:
+    items = []
+    for f in root.rglob("*"):
+        if not f.is_file() or f.suffix.lower() not in {".mkv",".mp4",".avi",".mov"}:
+            continue
+        name = f.stem
+        year = None
+        m = re.search(r"$$(\d{4})$$", name)
+        if m:
+            year = int(m.group(1))
+            name = name[:m.start()].strip()
+        se = re.search(r'(?i)s(?P<season>\d{1,2})(?:[xe]?(?P<episode>\d{1,2}))?', name)
+        season = int(se.group('season')) if se else None
+        episode = int(se.group('episode')) if se and se.group('episode') else None
+        items.append({
+            "title": name,
+            "year": year,
+            "season": season,
+            "episode": episode,
+            "local_meta": meta_name(f.name),
+            # Aucun champ `popularity` dans un dossier local, on laisse vide.
+            "popularity": None
         })
-    return eps
+    return items
 
-def normalize(t):
-    t = unicodedata.normalize('NFKD', t).encode('ascii','ignore').decode().lower()
-    t = re.sub(r'[^\w\s]', ' ', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    t = re.sub(r'^(the|le|la|les|un|une|l\'|d\')\s+', '', t)
-    t = re.sub(r'\s+(the|le|la|les|un|une|l\'|d\')$', '', t)
-    return t
-
-def parse_se_ep(name):
-    m = re.search(r'(?i)s(?P<season>\d{1,2})(?:[xe]?(?P<episode>\d{1,2}))?', name)
-    if not m: return None, None
-    season = int(m.group('season'))
-    ep = m.group('episode')
-    episode = int(ep) if ep else None
-    return season, episode
-
-def variants(item):
-    seen = set()
-    out = []
-    primary = item.get("title", "").strip()
-    primary = re.sub(r'\s*$$.*?$$', '', primary).strip()
-    if primary and primary not in seen:
-        out.append(("FR", primary)); seen.add(primary)
-    orig = item.get("originalTitle")
-    if orig:
-        orig = orig.strip()
-        orig = re.sub(r'\s*$$.*?$$', '', orig).strip()
-        if orig and orig not in seen:
-            out.append(("VO", orig)); seen.add(orig)
-    return out
-
-def lacale_search(q, pk, s=None, e=None):
-    params = {"q": q.strip() + (f" S{s:02d}" if s else "") + (f"E{e:02d}" if e else ""), "passkey": pk}
-    data = http_get(f"{API_BASE.rstrip('/')}/external", prm=params)
-    if isinstance(data, list): return bool(data)
-    if isinstance(data, dict): return bool(data.get("results", []))
-    return False
-
-def lacale_multi(item, pk, s=None, e=None):
-    found = []
-    for name, title in variants(item):
-        if lacale_search(title, pk, s, e):
-            found.append(name)
-    if not found: return False, "None"
-    if len(found) == 2: return True, "Both"
-    return True, found[0]
-
-def sort_items(lst, mode):
-    if mode == "oldest":   return sorted(lst, key=lambda x:(x.get("year",9999),x.get("title","").lower()))
-    if mode == "newest":   return sorted(lst, key=lambda x:(-x.get("year",0),x.get("title","").lower()))
-    if mode == "popular":  return sorted(lst, key=lambda x:x.get("popularity",0),reverse=True)
-    if mode == "least-popular": return sorted(lst, key=lambda x:x.get("popularity",0))
-    if mode == "az":  return sorted(lst, key=lambda x:x.get("title","").lower())
-    return sorted(lst, key=lambda x:x.get("title","").lower())
-
-def check_one(item, pk, lvl, season=None, episode=None):
-    t = item.get("title","??")
-    y = str(item.get("year",""))
-    present, var = lacale_multi(item, pk, season, episode)
-    return (t, y, season, episode, present, var)
-
-def parallel(items, pk, limit, workers, lvl):
-    sel = items[:limit]
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(check_one, it, pk, lvl): it for it in sel}
-        for f in as_completed(futures):
-            out.append(f.result())
-            time.sleep(DELAY)
-    return out
-
-def build_seasons(series, pk, limit, workers):
-    tasks = [(s, sn) for s in series for sn in s.get("season_numbers", [])][:limit]
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(check_one, ser, pk, "season", sn, None): (ser, sn) for ser, sn in tasks}
-        for f in as_completed(futs):
-            out.append(f.result())
-            time.sleep(DELAY)
-    return out
-
-def build_episodes(eps, pk, limit, workers):
-    tasks = eps[:limit]
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(check_one, ep, pk, "episode", ep.get("season"), ep.get("episode")): ep for ep in tasks}
-        for f in as_completed(futs):
-            out.append(f.result())
-            time.sleep(DELAY)
-    return out
-
-def display(header, rows, csv_path=None, hide=False, mode="full", test=False):
-    print("\n"+header); print("-"*len(header))
-    cols = ["Titre","Année"]
-    if mode in ("season","episode"): cols.append("Saison")
-    if mode=="episode": cols.append("Épisode")
-    cols.append("Sur La Cale")
-    if test: cols.append("Variant")
-    filtered = [r for r in rows if not (hide and r[4])]
-    tbl = []
-    for t,y,s,e,present,var in filtered:
-        row=[t,y]
-        if mode in ("season","episode"): row.append(str(s) if s else "")
-        if mode=="episode": row.append(str(e) if e else "")
-        row.append("✅ Oui" if present else "❌ Non")
-        if test: row.append(var)
-        tbl.append(row)
-    print(tabulate(tbl, headers=cols, tablefmt="github"))
-    if csv_path:
-        mode_w = "a" if csv_path.exists() else "w"
-        with csv_path.open(mode_w, newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if mode_w=="w": w.writerow(cols)
-            w.writerows(tbl)
-
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser()
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--radarr", action="store_true")
-    src.add_argument("--sonarr", action="store_true")
-    p.add_argument("--folder", type=Path)
-    p.add_argument("--export", type=Path, metavar="fichier.csv")
-    p.add_argument("--radarr-key", default=RADARR_KEY)
-    p.add_argument("--sonarr-key", default=SONARR_KEY)
-    p.add_argument("-l","--limit",type=int,default=100)
-    p.add_argument("--sort",choices=["oldest","newest","popular","least-popular","az"])
-    p.add_argument("--mode",choices=["full","season","episode"],default="full")
-    p.add_argument("--hide-present",action="store_true")
-    p.add_argument("--year-min",type=int)
-    p.add_argument("--year-max",type=int)
-    p.add_argument("--test",action="store_true")
-    a = p.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Comparer votre collection à La Cale.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Tri disponible :
+  az               → alphabétique A → Z
+  za               → alphabétique Z → A
+  newest           → du plus récent au plus ancien (année)
+  oldest           → du plus ancien au plus récent (année)
+  popular          → par champ `popularity` (descendant)
+  least-popular    → par champ `popularity` (ascendant)"""
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--radarr", action="store_true", help="Utiliser l'API Radarr.")
+    group.add_argument("--folder", type=Path, help="Analyser un répertoire local.")
+    parser.add_argument("-l","--limit", type=int, default=100,
+                       help="Nombre max d'éléments à vérifier.")
+    parser.add_argument("--sort", choices=[
+        "az","za","newest","oldest","popular","least-popular"
+    ], default="az", help="Mode de tri.")
+    parser.add_argument("--show", choices=["all","missing","sent","versioning"],
+                       default="all", help="Filtre d'affichage.")
+    parser.add_argument("--radarr-key", default=RADARR_KEY,
+                       help="Clé API Radarr (surcharge).")
+    args = parser.parse_args()
 
     if not PASSKEY:
-        print("[ERROR] PASSKEY missing",file=sys.stderr); sys.exit(1)
+        print(f"{C.R}[ERR]{C.Z} PASSKEY absent dans config.json", file=sys.stderr)
+        sys.exit(1)
 
-    if a.radarr and a.mode!="full":
-        print("[ERROR] Radarr only supports full mode",file=sys.stderr); sys.exit(1)
-
-    if a.folder:
-        if not a.folder.is_dir():
-            print("[ERROR] Invalid folder",file=sys.stderr); sys.exit(1)
-        items = []
-        for f in a.folder.rglob("*"):
-            if f.is_file() and f.suffix.lower() in {".mkv",".mp4",".avi",".mov"}:
-                t = f.stem
-                y = ""
-                if "(" in t and ")" in t.split("(")[-1]:
-                    yy = t.split("(")[-1].split(")")[0]
-                    if yy.isdigit() and len(yy)==4: y, t = yy, t.split("(")[0].strip()
-                s,e = parse_se_ep(t)
-                items.append({"title":t,"year":int(y) if y else None,"season":s,"episode":e})
-        source = "folder"
+    # --------------------------------------------------------------
+    # Chargement des items
+    # --------------------------------------------------------------
+    if args.folder:
+        if not args.folder.is_dir():
+            print(f"{C.R}[ERR]{C.Z} Le chemin indiqué n'est pas un dossier.", file=sys.stderr)
+            sys.exit(1)
+        items = folder_items(args.folder)
     else:
-        if a.radarr:
-            items = radarr_items(a.radarr_key or RADARR_KEY)
-            source = "radarr"
-        else:
-            key = a.sonarr_key or SONARR_KEY
-            if a.mode in ("full","season"):
-                items = sonarr_series(key)
-            else:
-                items = sonarr_items(key)
-            source = "sonarr"
+        items = radarr_items(args.radarr_key)
 
     if not items:
-        print("[ERROR] No items with associated files found",file=sys.stderr); sys.exit(1)
+        print(f"{C.Y}[WARN]{C.Z} Aucun élément trouvé.", file=sys.stderr)
+        sys.exit(0)
 
-    if a.year_min is not None or a.year_max is not None:
-        items = [i for i in items if i.get("year") and
-                 (a.year_min is None or i["year"]>=a.year_min) and
-                 (a.year_max is None or i["year"]<=a.year_max)]
-        if not items:
-            print("[ERROR] No items match year filter",file=sys.stderr); sys.exit(1)
+    # --------------------------------------------------------------
+    # Tri
+    # --------------------------------------------------------------
+    if args.sort in ("az", "za"):
+        reverse = args.sort == "za"
+        items.sort(key=lambda x: x["title"].lower(), reverse=reverse)
 
-    if a.mode=="full":
-        if a.sort:
-            items = sort_items(items, a.sort)
-            hdr = {
-                "oldest":"Top {} oldest".format(a.limit),
-                "newest":"Top {} newest".format(a.limit),
-                "popular":"Top {} popular".format(a.limit),
-                "least-popular":"Top {} least popular".format(a.limit),
-                "az":"Top {} (original order)".format(a.limit)
-            }[a.sort]
+    elif args.sort in ("newest", "oldest"):
+        reverse = args.sort == "newest"
+        items.sort(key=lambda x: x.get("year") or 0, reverse=reverse)
+
+    elif args.sort == "popular":
+        # Si le champ `popularity` existe, on l’utilise ; sinon on revient à l’alphabet.
+        if any(item.get("popularity") is not None for item in items):
+            items.sort(key=lambda x: x.get("popularity", 0), reverse=True)
         else:
-            hdr = f"First {a.limit} items (original order)"
-        rows = parallel(items, PASSKEY, a.limit, 5, "full")
-        display(hdr, rows, a.export, a.hide_present, mode="full", test=a.test)
-    elif a.mode=="season":
-        rows = build_seasons(items, PASSKEY, a.limit, 5)
-        display(f"Seasons (max {a.limit})", rows, a.export, a.hide_present, mode="season", test=a.test)
-    else:
-        rows = build_episodes(items, PASSKEY, a.limit, 5)
-        display(f"Episodes (max {a.limit})", rows, a.export, a.hide_present, mode="episode", test=a.test)
+            print(f"{C.Y}[INFO]{C.Z} Popularité non disponible – tri alphabétique appliqué.")
+            items.sort(key=lambda x: x["title"].lower())
+
+    elif args.sort == "least-popular":
+        if any(item.get("popularity") is not None for item in items):
+            items.sort(key=lambda x: x.get("popularity", 0))
+        else:
+            print(f"{C.Y}[INFO]{C.Z} Popularité non disponible – tri alphabétique inversé appliqué.")
+            items.sort(key=lambda x: x["title"].lower(), reverse=True)
+
+    # --------------------------------------------------------------
+    # Vérification
+    # --------------------------------------------------------------
+    rows = run_parallel(items, PASSKEY, args.limit)
+
+    # --------------------------------------------------------------
+    # Affichage
+    # --------------------------------------------------------------
+    legend()
+    hdr = f"Top {args.limit} éléments ({'dossier' if args.folder else 'Radarr'})"
+    show(hdr, rows, args.show)
 
 if __name__ == "__main__":
     main()
